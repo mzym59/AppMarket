@@ -1,0 +1,111 @@
+name: Build Unsigned APK
+
+on:
+  workflow_dispatch:            # 网页上手动点按钮触发
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "README.md"
+      - "doc/*"
+      - ".github/workflows/*.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 版本号可能从 git tag 推导
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ================= 路线 A：不传任何签名变量，尝试产出 unsigned APK =================
+      - name: Build (unsigned attempt)
+        id: build_unsigned
+        continue-on-error: true
+        run: ./gradlew :app:android:assembleRelease --stacktrace
+
+      # ================= 路线 B：若 A 因缺少 keystore 失败，用一次性密钥兜底 =================
+      # 这个包会被签上一个随机密钥 —— 反正要用 MT管理器 重签，不影响
+      - name: Generate throwaway keystore
+        if: steps.build_unsigned.outcome == 'failure'
+        run: |
+          keytool -genkeypair \
+            -keystore throwaway.jks -alias throwaway \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass throwaway -keypass throwaway \
+            -dname "CN=CI, OU=CI, O=CI, L=CI, ST=CI, C=CN"
+
+      - name: Build (throwaway key fallback)
+        if: steps.build_unsigned.outcome == 'failure'
+        env:
+          # 项目原本用的 4 个名字
+          KEYSTORE_PATH: ${{ github.workspace }}/throwaway.jks
+          KEYSTORE_PASS: throwaway
+          KEY_ALIAS: throwaway
+          KEY_PASSWORD: throwaway
+          # 顺手兼容几种常见的另一种命名，免得 Gradle 读不到
+          KEYSTORE_FILE: ${{ github.workspace }}/throwaway.jks
+          STORE_FILE: ${{ github.workspace }}/throwaway.jks
+          KEY_STORE_PASSWORD: throwaway
+          STORE_PASSWORD: throwaway
+          ALIAS: throwaway
+        run: ./gradlew :app:android:assembleRelease --stacktrace
+
+      # ================= 收集产物 =================
+      - name: Collect APK
+        run: |
+          APK_FILE=$(find . -path '*/build/outputs/apk/release/*.apk' -type f | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::没找到任何 APK，请检查模块路径是不是 :app:android"
+            exit 1
+          fi
+          {
+            echo "APK_FILE=$APK_FILE"
+            echo "APK_NAME=$(basename "$APK_FILE")"
+            echo "SIGN_NOTE=${{ steps.build_unsigned.outcome == 'success' && 'unsigned' || 'throwaway' }}"
+          } >> "$GITHUB_ENV"
+          echo "找到产物: $APK_FILE"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: ${{ env.APK_FILE }}
+          archive: false
+          if-no-files-found: error
+
+      # ================= 结果摘要 =================
+      - name: Summary
+        run: |
+          {
+            echo "### 构建结果"
+            echo ""
+            echo "- 产物：\`$APK_NAME\`"
+            echo "- 大小：$(du -h "$APK_FILE" | cut -f1)"
+            if [ "$SIGN_NOTE" = "unsigned" ]; then
+              echo "- 签名：**无**（干净未签名，直接用 MT管理器 签名）"
+            else
+              echo "- 签名：**一次性随机密钥** ⚠️ 用 MT管理器 重签后再安装"
+            fi
+            echo ""
+            echo "| 哈希 | 值 |"
+            echo "| --- | --- |"
+            echo "| SHA256 | \`$(sha256sum "$APK_FILE" | awk '{print $1}')\` |"
+            echo "| MD5 | \`$(md5sum "$APK_FILE" | awk '{print $1}')\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
